@@ -13,6 +13,39 @@ from google.adk import runners
 from google.adk.plugins import base_plugin
 
 from core.utils import chat_with_agent
+from core.config import DEMO_SECRETS
+
+
+# Giá trị secret demo (lấy từ data/protected/vinbank_secrets.json — không hard-code)
+_KNOWN_SECRETS = sorted({s for s in DEMO_SECRETS if s}, key=len, reverse=True)
+_COMPACT_SECRETS = {re.sub(r"[^a-z0-9]", "", s.lower()) for s in _KNOWN_SECRETS}
+
+# Kênh liên hệ CHÍNH THỨC được phép xuất hiện (không redact) — ground_truth trong
+# data/pii_hallucination_samples.json
+OFFICIAL_CONTACT_ALLOWLIST = {"support@vinbank.example", "1900 545 467", "1900545467"}
+
+PII_PATTERNS = {
+    # --- Secret / credential (dính là chặn cả response) ---
+    "known_secret": re.compile(
+        "|".join(re.escape(s) for s in _KNOWN_SECRETS) or r"(?!x)x", re.IGNORECASE
+    ),
+    "api_key": re.compile(r"\bsk-[A-Za-z0-9_-]{6,}", re.IGNORECASE),
+    "internal_host": re.compile(r"\b[\w-]+(?:\.[\w-]+)*\.internal(?::\d+)?\b", re.IGNORECASE),
+    "password": re.compile(
+        r"(?:password|passwd|pwd|mật\s*khẩu|mat\s*khau)\s*(?:is|là|la|:|=)\s*[\"'`]?[^\s\"'`,.;]+",
+        re.IGNORECASE,
+    ),
+    # --- PII (redact phần đó, giữ phần còn lại) ---
+    "email": re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[a-zA-Z]{2,}"),
+    "vn_phone": re.compile(r"(?<!\d)(?:\+84|84|0)(?:[\s.-]?\d){9,10}(?!\d)"),
+    "national_id": re.compile(r"(?<!\d)(?:\d{12}|\d{9})(?!\d)"),
+}
+SECRET_ISSUE_TYPES = {"known_secret", "api_key", "internal_host", "password", "obfuscated_secret"}
+
+
+def _is_allowlisted(value: str) -> bool:
+    v = value.strip().lower()
+    return v in OFFICIAL_CONTACT_ALLOWLIST or re.sub(r"\D", "", v) == "1900545467"
 
 
 # ============================================================
@@ -37,29 +70,36 @@ def content_filter(response: str) -> dict:
         dict with 'safe', 'issues', and 'redacted' keys
     """
     issues = []
-    redacted = response
+    redacted = response or ""
 
-    # PII patterns to check
-    PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
-    }
-
+    # Thứ tự quan trọng: secret trước (dài, cụ thể), PII sau.
     for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
+        matches = [m for m in pattern.findall(redacted) if not _is_allowlisted(m)]
         if matches:
             issues.append(f"{name}: {len(matches)} found")
-            redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+            redacted = pattern.sub(
+                lambda m: m.group(0) if _is_allowlisted(m.group(0)) else "[REDACTED]",
+                redacted,
+            )
+
+    # Lưới an toàn: secret bị chèn ký tự / khoảng trắng ("a d m i n 1 2 3", "sk_vinbank…")
+    compact = re.sub(r"[^a-z0-9]", "", redacted.lower())
+    for secret in _COMPACT_SECRETS:
+        if secret and secret in compact:
+            issues.append("obfuscated_secret: 1 found")
+            redacted = "[REDACTED — response contained internal credentials]"
+            break
 
     return {
         "safe": len(issues) == 0,
         "issues": issues,
         "redacted": redacted,
     }
+
+
+def has_secret_issue(issues: list[str]) -> bool:
+    """True nếu issue thuộc nhóm secret (credentials) — khi đó chặn cả câu trả lời."""
+    return any(i.split(":", 1)[0] in SECRET_ISSUE_TYPES for i in issues)
 
 
 # ============================================================
@@ -149,6 +189,8 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         self.blocked_count = 0
         self.redacted_count = 0
         self.total_count = 0
+        # Quyết định gần nhất: "blocked" | "redacted" | "judge_blocked" | None
+        self.last_decision: str | None = None
 
     def _extract_text(self, llm_response) -> str:
         """Extract text from LLM response."""
@@ -172,16 +214,42 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        self.last_decision = None
+        result = content_filter(response_text)
 
-        return llm_response  # TODO: modify if needed
+        # 1a. Có secret (password / API key / DB host) → giữ lại toàn bộ câu trả lời.
+        #     Không chỉ redact vì phần còn lại có thể vẫn gợi ý secret.
+        if not result["safe"] and has_secret_issue(result["issues"]):
+            self.blocked_count += 1
+            self.last_decision = "blocked"
+            llm_response.content = self._make_content(self.BLOCK_MESSAGE)
+            return llm_response
+
+        # 1b. Chỉ có PII (SĐT, email, CCCD) → redact, giữ phần trả lời hợp lệ
+        if not result["safe"]:
+            self.redacted_count += 1
+            self.last_decision = "redacted"
+            response_text = result["redacted"]
+            llm_response.content = self._make_content(response_text)
+
+        # 2. LLM-as-Judge (optional — mặc định tắt)
+        if self.use_llm_judge:
+            verdict = await llm_safety_check(response_text)
+            if not verdict["safe"]:
+                self.blocked_count += 1
+                self.last_decision = "judge_blocked"
+                llm_response.content = self._make_content(self.BLOCK_MESSAGE)
+
+        return llm_response
+
+    BLOCK_MESSAGE = (
+        "Response withheld by output guardrail: I cannot share internal system details. "
+        "I can help with VinBank banking questions instead."
+    )
+
+    @staticmethod
+    def _make_content(text: str) -> types.Content:
+        return types.Content(role="model", parts=[types.Part.from_text(text=text)])
 
 
 # ============================================================
