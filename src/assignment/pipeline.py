@@ -229,6 +229,11 @@ async def run_assignment_suite(pipeline) -> dict:
     output_plugin = _find(plugins, "OutputGuardrailPlugin")
 
     agent, runner = create_blue_agent(plugins)
+    # Model free trên OpenRouter hay trả 504/429 khi quá tải: giới hạn mỗi lần gọi
+    # 60s và cho thử lại nhiều hơn (SDK tự backoff giữa các lần thử).
+    if isinstance(getattr(runner, "client_kwargs", None), dict):
+        runner.client_kwargs.setdefault("timeout", 60)
+        runner.client_kwargs.setdefault("max_retries", 5)
 
     def _counters():
         return (
